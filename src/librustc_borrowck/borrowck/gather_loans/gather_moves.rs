@@ -48,7 +48,7 @@ pub fn gather_move_from_expr<'a, 'tcx>(bccx: &BorrowckCtxt<'a, 'tcx>,
                                        cmt: mc::cmt<'tcx>,
                                        move_reason: euv::MoveReason) {
     let kind = match move_reason {
-        euv::DirectRefMove | euv::PatBindingMove => MoveExpr,
+        euv::DirectRefMove | euv::ForgetMove | euv::PatBindingMove => MoveExpr,
         euv::CaptureMove => Captured
     };
     let move_info = GatherMoveInfo {

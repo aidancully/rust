@@ -31,6 +31,8 @@ use util::ppaux::Repr;
 
 use std::marker;
 use syntax::{ast, ast_util};
+use syntax::abi::RustIntrinsic;
+use syntax::parse::token;
 use syntax::ptr::P;
 use syntax::codemap::Span;
 
@@ -116,6 +118,7 @@ pub enum ConsumeMode {
 #[derive(Copy, PartialEq, Debug)]
 pub enum MoveReason {
     DirectRefMove,
+    ForgetMove,
     PatBindingMove,
     CaptureMove,
 }
@@ -308,9 +311,14 @@ pub struct ExprUseVisitor<'d,'t,'tcx:'t,TYPER:'t> {
 // it does not propagate the error.
 macro_rules! return_if_err {
     ($inp: expr) => (
+        return_if_err_ext!($inp, ())
+    )
+}
+macro_rules! return_if_err_ext {
+    ($inp: expr, $rval: expr) => (
         match $inp {
             Ok(v) => v,
-            Err(()) => return
+            Err(()) => return $rval
         }
     )
 }
@@ -364,24 +372,37 @@ impl<'d,'t,'tcx,TYPER:mc::Typer<'tcx>> ExprUseVisitor<'d,'t,'tcx,TYPER> {
                         consume_id: ast::NodeId,
                         consume_span: Span,
                         cmt: mc::cmt<'tcx>) {
+        self.delegate_consume_ext(DirectRefMove, consume_id, consume_span, cmt);
+    }
+    fn delegate_consume_ext(&mut self,
+                            move_reason: MoveReason,
+                            consume_id: ast::NodeId,
+                            consume_span: Span,
+                            cmt: mc::cmt<'tcx>) {
         debug!("delegate_consume(consume_id={}, cmt={})",
                consume_id, cmt.repr(self.tcx()));
 
-        let mode = copy_or_move(self.typer, &cmt, DirectRefMove);
+        let mode = copy_or_move(self.typer, &cmt, move_reason);
         self.delegate.consume(consume_id, consume_span, cmt, mode);
     }
 
     fn consume_exprs(&mut self, exprs: &Vec<P<ast::Expr>>) {
+        self.consume_exprs_ext(exprs, DirectRefMove);
+    }
+    fn consume_exprs_ext(&mut self, exprs: &Vec<P<ast::Expr>>, move_reason: MoveReason) {
         for expr in exprs {
-            self.consume_expr(&**expr);
+            self.consume_expr_ext(&**expr, move_reason);
         }
     }
 
     pub fn consume_expr(&mut self, expr: &ast::Expr) {
-        debug!("consume_expr(expr={})", expr.repr(self.tcx()));
+        self.consume_expr_ext(expr, DirectRefMove);
+    }
+    pub fn consume_expr_ext(&mut self, expr: &ast::Expr, move_reason: MoveReason) {
+        debug!("consume_expr(expr={}, move_reason={:?})", expr.repr(self.tcx()), move_reason);
 
         let cmt = return_if_err!(self.mc.cat_expr(expr));
-        self.delegate_consume(expr.id, expr.span, cmt);
+        self.delegate_consume_ext(move_reason, expr.id, expr.span, cmt);
         self.walk_expr(expr);
     }
 
@@ -457,8 +478,8 @@ impl<'d,'t,'tcx,TYPER:mc::Typer<'tcx>> ExprUseVisitor<'d,'t,'tcx,TYPER> {
             }
 
             ast::ExprCall(ref callee, ref args) => {    // callee(args)
-                self.walk_callee(expr, &**callee);
-                self.consume_exprs(args);
+                let move_reason = self.walk_callee(expr, &**callee);
+                self.consume_exprs_ext(args, move_reason);
             }
 
             ast::ExprMethodCall(_, _, ref args) => { // callee.m(args)
@@ -618,16 +639,76 @@ impl<'d,'t,'tcx,TYPER:mc::Typer<'tcx>> ExprUseVisitor<'d,'t,'tcx,TYPER> {
         }
     }
 
-    fn walk_callee(&mut self, call: &ast::Expr, callee: &ast::Expr) {
-        let callee_ty = return_if_err!(self.typer.expr_ty_adjusted(callee));
-        debug!("walk_callee: callee={} callee_ty={}",
-               callee.repr(self.tcx()), callee_ty.repr(self.tcx()));
-        let call_scope = region::CodeExtent::from_node_id(call.id);
-        match callee_ty.sty {
-            ty::ty_bare_fn(..) => {
-                self.consume_expr(callee);
+    fn walk_callee(&mut self, call: &ast::Expr, callee: &ast::Expr) -> MoveReason {
+        let callee_ty = return_if_err_ext!(self.typer.expr_ty_adjusted(callee), DirectRefMove);
+        debug!("walk_callee: callee={} (also({:?}) callee_ty={}",
+               callee.repr(self.tcx()), callee, callee_ty.repr(self.tcx()));
+        /*
+        Expr {
+            id: 25684,
+            node: ExprPath(
+                Path {
+                    span: Span {
+                        lo: BytePos(149794),
+                        hi: BytePos(149805),
+                        expn_id: ExpnId(4294967295)
+                    },
+                    global: false,
+                    segments: [
+                        PathSegment {
+                            identifier: mem#3049,
+                            parameters: AngleBracketedParameters(
+                                AngleBracketedParameterData {
+                                    lifetimes: [],
+                                    types: [],
+                                    bindings: []
+                                })
+                        },
+                        PathSegment {
+                            identifier: forget#3049,
+                            parameters: AngleBracketedParameters(
+                                AngleBracketedParameterData {
+                                    lifetimes: [],
+                                    types: [],
+                                    bindings: []
+                                })
+                        }]
+                }),
+            span: Span {
+                lo: BytePos(149794),
+                hi: BytePos(149805),
+                expn_id: ExpnId(4294967295)
             }
-            ty::ty_err => { }
+        }
+         */
+        let call_scope = region::CodeExtent::from_node_id(call.id);
+        let rval = match callee_ty.sty {
+            ty::ty_bare_fn(_, ref bfty) => {
+                self.consume_expr(callee);
+                debug!("walk_callee: bare_fn");
+                if bfty.abi == RustIntrinsic {
+                    // FIXME: there's got to be an easier way to find the name
+                    // of the function being called? Alternatively, the ABI
+                    // could be modified to say that the function obeys "forget"
+                    // semantics...
+                    match callee {
+                        &ast::Expr { node: ast::Expr_::ExprPath(ast::Path { ref segments, .. }), .. } => {
+                            let &ast::PathSegment { identifier: segment, .. } = segments.last().unwrap();
+                            let tok = &token::get_ident(segment)[];
+                            debug!("walk_callee: intrinsic ident: {:?}", tok);
+                            if tok == "forget" {
+                                ForgetMove
+                            } else {
+                                DirectRefMove
+                            }
+                        },
+                        _ => DirectRefMove
+                    }
+                } else {
+                    DirectRefMove
+                }
+            }
+            ty::ty_err => { DirectRefMove }
             _ => {
                 let overloaded_call_type =
                     match self.typer.node_method_origin(MethodCall::expr(call.id)) {
@@ -656,9 +737,12 @@ impl<'d,'t,'tcx,TYPER:mc::Typer<'tcx>> ExprUseVisitor<'d,'t,'tcx,TYPER> {
                                          ClosureInvocation);
                     }
                     FnOnceOverloadedCall => self.consume_expr(callee),
-                }
+                };
+                DirectRefMove
             }
-        }
+        };
+        debug!("walk_callee end: {:?}", rval);
+        rval
     }
 
     fn walk_stmt(&mut self, stmt: &ast::Stmt) {

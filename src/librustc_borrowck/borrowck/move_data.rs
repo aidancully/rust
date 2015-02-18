@@ -657,6 +657,7 @@ impl<'a, 'tcx> FlowedMoveData<'a, 'tcx> {
     pub fn each_move_of<F>(&self,
                            id: ast::NodeId,
                            loan_path: &Rc<LoanPath<'tcx>>,
+                           forgetting: bool,
                            mut f: F)
                            -> bool where
         F: FnMut(&Move, &LoanPath<'tcx>) -> bool,
@@ -665,6 +666,7 @@ impl<'a, 'tcx> FlowedMoveData<'a, 'tcx> {
         //
         // 1. Move of `a.b.c`, use of `a.b.c`
         // 2. Move of `a.b.c`, use of `a.b.c.d`
+        // and, if not a "forgetting" move:
         // 3. Move of `a.b.c`, use of `a` or `a.b`
         //
         // OK scenario:
@@ -690,7 +692,7 @@ impl<'a, 'tcx> FlowedMoveData<'a, 'tcx> {
                 if !f(the_move, &*self.move_data.path_loan_path(moved_path)) {
                     ret = false;
                 }
-            } else {
+            } else if !forgetting {
                 if let Some(loan_path_index) = opt_loan_path_index {
                     let cont = self.move_data.each_base_path(moved_path, |p| {
                         if p == loan_path_index {

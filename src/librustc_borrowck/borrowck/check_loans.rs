@@ -139,7 +139,7 @@ impl<'a, 'tcx> euv::Delegate<'tcx> for CheckLoanCtxt<'a, 'tcx> {
                     euv::ClosureCapture(_) => MovedInCapture,
                     _ => MovedInUse,
                 };
-                self.check_if_path_is_moved(borrow_id, borrow_span, moved_value_use_kind, &lp);
+                self.check_if_path_is_moved(borrow_id, borrow_span, moved_value_use_kind, false, &lp);
             }
             None => { }
         }
@@ -176,6 +176,7 @@ impl<'a, 'tcx> euv::Delegate<'tcx> for CheckLoanCtxt<'a, 'tcx> {
                         self.check_if_path_is_moved(assignee_cmt.id,
                                                     assignment_span,
                                                     MovedInUse,
+                                                    false,
                                                     &lp);
                     }
                 }
@@ -579,13 +580,13 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                       mode: euv::ConsumeMode) {
         match opt_loan_path(&cmt) {
             Some(lp) => {
-                let moved_value_use_kind = match mode {
+                let (moved_value_use_kind, forgetting) = match mode {
                     euv::Copy => {
                         self.check_for_copy_of_frozen_path(id, span, &*lp);
-                        MovedInUse
+                        (MovedInUse, false)
                     }
-                    euv::Move(_) => {
-                        match self.move_data.kind_of_move_of_path(id, &lp) {
+                    euv::Move(move_reason) => {
+                        let moved_value_use_kind = match self.move_data.kind_of_move_of_path(id, &lp) {
                             None => {
                                 // Sometimes moves don't have a move kind;
                                 // this either means that the original move
@@ -603,11 +604,12 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                                     MovedInUse
                                 }
                             }
-                        }
+                        };
+                        (moved_value_use_kind, move_reason == euv::ForgetMove)
                     }
                 };
 
-                self.check_if_path_is_moved(id, span, moved_value_use_kind, &lp);
+                self.check_if_path_is_moved(id, span, moved_value_use_kind, forgetting, &lp);
             }
             None => { }
         }
@@ -696,6 +698,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                               id: ast::NodeId,
                               span: Span,
                               use_kind: MovedValueUseKind,
+                              forgetting: bool,
                               lp: &Rc<LoanPath<'tcx>>) {
         debug!("check_if_path_is_moved(id={}, use_kind={:?}, lp={})",
                id, use_kind, lp.repr(self.bccx.tcx));
@@ -705,7 +708,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
         // consider refactoring this instead!
 
         let base_lp = owned_ptr_base_path_rc(lp);
-        self.move_data.each_move_of(id, &base_lp, |the_move, moved_lp| {
+        self.move_data.each_move_of(id, &base_lp, forgetting, |the_move, moved_lp| {
             self.bccx.report_use_of_moved_value(
                 span,
                 use_kind,
@@ -760,7 +763,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
                             // FIXME (22079): could refactor via hypothetical
                             // generalized check_if_path_is_moved
                             let loan_path = owned_ptr_base_path_rc(lp_base);
-                            self.move_data.each_move_of(id, &loan_path, |_, _| {
+                            self.move_data.each_move_of(id, &loan_path, false, |_, _| {
                                 self.bccx
                                     .report_partial_reinitialization_of_uninitialized_structure(
                                         span,
@@ -781,7 +784,7 @@ impl<'a, 'tcx> CheckLoanCtxt<'a, 'tcx> {
             LpExtend(ref lp_base, _, LpDeref(_)) => {
                 // assigning to `P[i]` requires `P` is initialized
                 // assigning to `(*P)` requires `P` is initialized
-                self.check_if_path_is_moved(id, span, use_kind, lp_base);
+                self.check_if_path_is_moved(id, span, use_kind, false, lp_base);
             }
         }
     }
